@@ -1,4 +1,4 @@
-#include "DShotRMT.h"
+#include "DShotESC.h"
 #include "freertos/task.h"
 
 #define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
@@ -13,33 +13,7 @@ static const char *TAG = "dshot-rmt";
 	__ret;                             \
 })
 
-// from https://github.com/bitdump/BLHeli/blob/master/BLHeli_32%20ARM/BLHeli_32%20Firmware%20specs/Digital_Cmd_Spec.txt
-enum dshot_cmd_t
-{
-	DIGITAL_CMD_MOTOR_STOP, 		      // Currently not implemented
-	DIGITAL_CMD_BEEP1, 			      // Wait at least length of beep (260ms) before next command
-	DIGITAL_CMD_BEEP2, 			      // Wait at least length of beep (260ms) before next command
-	DIGITAL_CMD_BEEP3, 			      // Wait at least length of beep (280ms) before next command
-	DIGITAL_CMD_BEEP4, 			      // Wait at least length of beep (280ms) before next command
-	DIGITAL_CMD_BEEP5, 			      // Wait at least length of beep (1020ms) before next command
-	DIGITAL_CMD_ESC_INFO,  		      // Wait at least 12ms before next command
-	DIGITAL_CMD_SPIN_DIRECTION_1, 	      // Need 6x, no wait required
-	DIGITAL_CMD_SPIN_DIRECTION_2, 	      // Need 6x, no wait required
-	DIGITAL_CMD_3D_MODE_OFF, 		      // Need 6x, no wait required
-	DIGITAL_CMD_3D_MODE_ON,  		      // Need 6x, no wait required
-	DIGITAL_CMD_SETTINGS_REQUEST,  	      // Currently not implemented
-	DIGITAL_CMD_SAVE_SETTINGS,  		      // Need 6x, wait at least 35ms before next command
-	DIGITAL_CMD_SPIN_DIRECTION_NORMAL = 20, 	      // Need 6x, no wait required
-	DIGITAL_CMD_SPIN_DIRECTION_REVERSED, 	      // Need 6x, no wait required
-	DIGITAL_CMD_LED0_ON, 			      // No wait required
-	DIGITAL_CMD_LED1_ON, 			      // No wait required
-	DIGITAL_CMD_LED2_ON, 			      // No wait required
-	DIGITAL_CMD_LED3_ON, 			      // No wait required
-	DIGITAL_CMD_LED0_OFF, 		      // No wait required
-	DIGITAL_CMD_LED1_OFF, 		      // No wait required
-	DIGITAL_CMD_LED2_OFF, 		      // No wait required
-	DIGITAL_CMD_LED3_OFF, 		      // No wait required
-};
+
 
 // DSHOT Timings
 #define DSHOT_TICKS_PER_BIT 19
@@ -60,8 +34,9 @@ enum dshot_cmd_t
 
 #define DSHOT_ARM_DELAY (5000 / portTICK_PERIOD_MS)
 
-DShotRMT::DShotRMT()
+DShotESC::DShotESC()
 {
+	_rmtChannel = RMT_CHANNEL_MAX;
 	// initialize cmd buffer
 	setData(0);
 
@@ -72,12 +47,15 @@ DShotRMT::DShotRMT()
 	_dshotCmd[16].level1 = 0;
 }
 
-DShotRMT::~DShotRMT()
+DShotESC::~DShotESC()
 {
-	// TODO write destructor
+	if (_rmtChannel != RMT_CHANNEL_MAX)
+	{
+		uninstall();
+	}
 }
 
-esp_err_t DShotRMT::install(gpio_num_t gpio, rmt_channel_t rmtChannel)
+esp_err_t DShotESC::install(gpio_num_t gpio, rmt_channel_t rmtChannel)
 {
 	_rmtChannel = rmtChannel;
 
@@ -99,13 +77,14 @@ esp_err_t DShotRMT::install(gpio_num_t gpio, rmt_channel_t rmtChannel)
 	return rmt_driver_install(rmtChannel, 0, 0);
 }
 
-esp_err_t DShotRMT::uninstall()
+esp_err_t DShotESC::uninstall()
 {
-	// TODO implement uninstall
-	return ESP_OK;
+	auto status = rmt_driver_uninstall(_rmtChannel);
+	_rmtChannel = RMT_CHANNEL_MAX;
+	return status;
 }
 
-esp_err_t DShotRMT::init(bool wait)
+esp_err_t DShotESC::init(bool wait)
 {
 	ESP_LOGD(TAG, "Sending reset command");
 	for (int i = 0; i < 50; i++)
@@ -123,32 +102,96 @@ esp_err_t DShotRMT::init(bool wait)
 	return ESP_OK;
 }
 
-esp_err_t DShotRMT::sendThrottle(uint16_t throttle)
+esp_err_t DShotESC::sendThrottle(uint16_t throttle)
 {
-	if (throttle < DSHOT_THROTTLE_MIN || throttle > DSHOT_THROTTLE_MAX)
-		return ESP_ERR_INVALID_ARG;
+	if (throttle > DSHOT_THROTTLE_MAX - DSHOT_THROTTLE_MIN)
+	{
+		throttle = DSHOT_THROTTLE_MAX;
+	}
+	else
+	{
+		throttle += DSHOT_THROTTLE_MIN;
+	}
 
 	return writePacket({throttle, 0}, false);
 }
 
-esp_err_t DShotRMT::setReversed(bool reversed)
+esp_err_t DShotESC::sendThrottle3D(int16_t throttle)
 {
-	DSHOT_ERROR_CHECK(rmt_wait_tx_done(_rmtChannel, 1));
-	DSHOT_ERROR_CHECK(repeatPacketTicks({DSHOT_THROTTLE_MIN, 0}, 200 / portTICK_PERIOD_MS));
+	if (throttle > 999)
+	{
+		throttle = 999;
+	}
+	if (throttle < -999)
+	{
+		throttle = -999;
+	}
+	if (throttle < 0)
+	{
+		throttle = 1000-throttle;
+	}
+	return sendThrottle(throttle);
+}
+
+esp_err_t DShotESC::setReversed(bool reversed)
+{
 	DSHOT_ERROR_CHECK(repeatPacket(
-			{reversed ? DIGITAL_CMD_SPIN_DIRECTION_REVERSED : DIGITAL_CMD_SPIN_DIRECTION_NORMAL, 1},
+			{reversed ? (uint16_t)DSHOT_CMD::SPIN_DIRECTION_REVERSED : (uint16_t)DSHOT_CMD::SPIN_DIRECTION_NORMAL, 1},
 			10));
 	return ESP_OK;
 }
 
-esp_err_t DShotRMT::beep()
+esp_err_t DShotESC::set3DMode(bool active)
 {
-	DSHOT_ERROR_CHECK(writePacket({DIGITAL_CMD_BEEP1, 1}, true));
-	vTaskDelay(260 / portTICK_PERIOD_MS);
+	DSHOT_ERROR_CHECK(repeatPacket(
+			{active ? (uint16_t)DSHOT_CMD::MODE_3D_ON : (uint16_t)DSHOT_CMD::MODE_3D_OFF, 1},
+			10));
 	return ESP_OK;
 }
 
-void DShotRMT::setData(uint16_t data)
+esp_err_t DShotESC::beep(uint8_t tone)
+{
+	tone += (uint16_t)DSHOT_CMD::BEEP1;
+	if (tone > (uint16_t)DSHOT_CMD::BEEP5)
+	{
+		tone = (uint16_t)DSHOT_CMD::BEEP5;
+	}
+	DSHOT_ERROR_CHECK(writePacket({tone, 1}, true));
+	if (tone == (uint16_t)DSHOT_CMD::BEEP5)
+	{
+		vTaskDelay(1020 / portTICK_PERIOD_MS);
+	}
+	else
+	{
+		vTaskDelay(260 / portTICK_PERIOD_MS);
+	}
+	return ESP_OK;
+}
+
+esp_err_t DShotESC::setLED(uint16_t led, bool active)
+{
+	led += (uint16_t)DSHOT_CMD::LED0_ON;
+	if (led > (uint16_t)DSHOT_CMD::LED3_ON)
+	{
+		led = (uint16_t)DSHOT_CMD::LED3_ON;
+	}
+	if (!active)
+	{
+		led += (uint16_t)DSHOT_CMD::LED0_OFF - (uint16_t)DSHOT_CMD::LED0_ON;
+	}
+	DSHOT_ERROR_CHECK(writePacket({led, 1}, true));
+	return ESP_OK;
+}
+
+esp_err_t DShotESC::saveSettings()
+{
+	DSHOT_ERROR_CHECK(repeatPacket(
+			{(uint16_t)DSHOT_CMD::SAVE_SETTINGS, 1},
+			10));
+	return ESP_OK;
+}
+
+void DShotESC::setData(uint16_t data)
 {
 	for (int i = 0; i < 16; i++, data <<= 1)
 	{
@@ -171,7 +214,7 @@ void DShotRMT::setData(uint16_t data)
 	}
 }
 
-uint8_t DShotRMT::checksum(uint16_t data)
+uint8_t DShotESC::checksum(uint16_t data)
 {
 	uint16_t csum = 0;
 
@@ -184,7 +227,7 @@ uint8_t DShotRMT::checksum(uint16_t data)
 	return csum & 0xf;
 }
 
-esp_err_t DShotRMT::writeData(uint16_t data, bool wait)
+esp_err_t DShotESC::writeData(uint16_t data, bool wait)
 {
 	DSHOT_ERROR_CHECK(rmt_wait_tx_done(_rmtChannel, 0));
 
@@ -195,7 +238,7 @@ esp_err_t DShotRMT::writeData(uint16_t data, bool wait)
 						   wait);
 }
 
-esp_err_t DShotRMT::writePacket(dshot_packet_t packet, bool wait)
+esp_err_t DShotESC::writePacket(dshot_packet_t packet, bool wait)
 {
 	uint16_t data = packet.payload;
 
@@ -207,7 +250,7 @@ esp_err_t DShotRMT::writePacket(dshot_packet_t packet, bool wait)
 	return writeData(data, wait);
 }
 
-esp_err_t DShotRMT::repeatPacket(dshot_packet_t packet, int n)
+esp_err_t DShotESC::repeatPacket(dshot_packet_t packet, int n)
 {
 	for (int i = 0; i < n; i++)
 	{
@@ -217,7 +260,7 @@ esp_err_t DShotRMT::repeatPacket(dshot_packet_t packet, int n)
 	return ESP_OK;
 }
 
-esp_err_t DShotRMT::repeatPacketTicks(dshot_packet_t packet, TickType_t ticks)
+esp_err_t DShotESC::repeatPacketTicks(dshot_packet_t packet, TickType_t ticks)
 {
 	DSHOT_ERROR_CHECK(rmt_wait_tx_done(_rmtChannel, ticks));
 
