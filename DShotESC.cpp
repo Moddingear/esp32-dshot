@@ -15,18 +15,6 @@ static const char *TAG = "dshot-rmt";
 
 
 
-// DSHOT Timings
-#define DSHOT_TICKS_PER_BIT 19
-
-#define DSHOT_T0H 7
-#define DSHOT_T0L (DSHOT_TICKS_PER_BIT - DSHOT_T0H)
-
-#define DSHOT_T1H 14
-#define DSHOT_T1L (DSHOT_TICKS_PER_BIT - DSHOT_T1H)
-
-#define DSHOT_PAUSE (DSHOT_TICKS_PER_BIT * 200)
-// !DSHOT Timings
-
 #define RMT_CMD_SIZE (sizeof(_dshotCmd) / sizeof(_dshotCmd[0]))
 
 #define DSHOT_THROTTLE_MIN 48
@@ -41,7 +29,7 @@ DShotESC::DShotESC()
 	setData(0);
 
 	// DShot packet delay + RMT end marker
-	_dshotCmd[16].duration0 = DSHOT_PAUSE;
+	_dshotCmd[16].duration0 = dt_pause;
 	_dshotCmd[16].level0 = 0;
 	_dshotCmd[16].duration1 = 0;
 	_dshotCmd[16].level1 = 0;
@@ -55,9 +43,19 @@ DShotESC::~DShotESC()
 	}
 }
 
-esp_err_t DShotESC::install(gpio_num_t gpio, rmt_channel_t rmtChannel)
+esp_err_t DShotESC::install(gpio_num_t gpio, rmt_channel_t rmtChannel, unsigned long DSHOT_FREQUENCY, uint8_t rmtdivider)
 {
 	_rmtChannel = rmtChannel;
+
+	double core_ticks_per_bit = APB_CLK_FREQ/DSHOT_FREQUENCY;
+	dt_tpb = core_ticks_per_bit/rmtdivider;
+	dt_t0h = core_ticks_per_bit/rmtdivider/3;
+	dt_t1h = core_ticks_per_bit/rmtdivider*2/3;
+	dt_t0l = dt_tpb-dt_t0h;
+	dt_t1l = dt_tpb-dt_t1h;
+	dt_pause = dt_tpb*200;
+	divider = rmtdivider;
+	
 
 	rmt_config_t config;
 
@@ -65,7 +63,7 @@ esp_err_t DShotESC::install(gpio_num_t gpio, rmt_channel_t rmtChannel)
 	config.rmt_mode = RMT_MODE_TX;
 	config.gpio_num = gpio;
 	config.mem_block_num = 1;
-	config.clk_div = 7;
+	config.clk_div = rmtdivider; //Source clock is 80MHz, divided by that number, gives 0.0875us/tick
 
 	config.tx_config.loop_en = false;
 	config.tx_config.carrier_en = false;
@@ -84,20 +82,32 @@ esp_err_t DShotESC::uninstall()
 	return status;
 }
 
-esp_err_t DShotESC::init(bool wait)
+esp_err_t DShotESC::init()
 {
 	ESP_LOGD(TAG, "Sending reset command");
 	for (int i = 0; i < 50; i++)
 	{
 		writeData(0, true);
 	}
+	
+	return ESP_OK;
+}
 
-	ESP_LOGD(TAG, "Sending idle throttle");
-	if (wait)
-		DSHOT_ERROR_CHECK(repeatPacketTicks({DSHOT_THROTTLE_MIN, 0}, DSHOT_ARM_DELAY));
-	else
-		writePacket({DSHOT_THROTTLE_MIN, 0}, false);
+esp_err_t DShotESC::sendMotorStop()
+{
+	return writePacket({(uint16_t)DSHOT_CMD::MOTOR_STOP, 0}, false);
+}
 
+esp_err_t DShotESC::throttleArm(int ArmDuration)
+{
+	DSHOT_ERROR_CHECK(repeatPacketTicks({DSHOT_THROTTLE_MIN, 0}, ArmDuration/portTICK_PERIOD_MS));
+	ESP_LOGD(TAG, "ESC armed");
+	return ESP_OK;
+}
+
+esp_err_t DShotESC::blueJayArm(int ArmDuration)
+{
+	DSHOT_ERROR_CHECK(repeatPacketTicks({(uint16_t)DSHOT_CMD::MOTOR_STOP, 0}, ArmDuration/portTICK_PERIOD_MS));
 	ESP_LOGD(TAG, "ESC armed");
 	return ESP_OK;
 }
@@ -118,6 +128,7 @@ esp_err_t DShotESC::sendThrottle(uint16_t throttle)
 
 esp_err_t DShotESC::sendThrottle3D(int16_t throttle)
 {
+	//clamp throttle between -999 and 999
 	if (throttle > 999)
 	{
 		throttle = 999;
@@ -126,6 +137,7 @@ esp_err_t DShotESC::sendThrottle3D(int16_t throttle)
 	{
 		throttle = -999;
 	}
+	//if throttle is negative, wrap it from -999 to 0 to 1000 to 1999
 	if (throttle < 0)
 	{
 		throttle = 1000-throttle;
@@ -191,6 +203,16 @@ esp_err_t DShotESC::saveSettings()
 	return ESP_OK;
 }
 
+esp_err_t DShotESC::WaitTXDone(TickType_t waitTime)
+{
+	return rmt_wait_tx_done(_rmtChannel, waitTime);
+}
+
+uint8_t DShotESC::GetDivider()
+{
+	return divider;
+}
+
 void DShotESC::setData(uint16_t data)
 {
 	for (int i = 0; i < 16; i++, data <<= 1)
@@ -198,17 +220,17 @@ void DShotESC::setData(uint16_t data)
 		if (data & 0x8000)
 		{
 			// set one
-			_dshotCmd[i].duration0 = DSHOT_T1H;
+			_dshotCmd[i].duration0 = dt_t1h;
 			_dshotCmd[i].level0 = 1;
-			_dshotCmd[i].duration1 = DSHOT_T1L;
+			_dshotCmd[i].duration1 = dt_t1l;
 			_dshotCmd[i].level1 = 0;
 		}
 		else
 		{
 			// set zero
-			_dshotCmd[i].duration0 = DSHOT_T0H;
+			_dshotCmd[i].duration0 = dt_t0h;
 			_dshotCmd[i].level0 = 1;
-			_dshotCmd[i].duration1 = DSHOT_T0L;
+			_dshotCmd[i].duration1 = dt_t0l;
 			_dshotCmd[i].level1 = 0;
 		}
 	}
@@ -262,13 +284,14 @@ esp_err_t DShotESC::repeatPacket(dshot_packet_t packet, int n)
 
 esp_err_t DShotESC::repeatPacketTicks(dshot_packet_t packet, TickType_t ticks)
 {
-	DSHOT_ERROR_CHECK(rmt_wait_tx_done(_rmtChannel, ticks));
+	
 
 	TickType_t repeatStop = xTaskGetTickCount() + ticks;
-	while (xTaskGetTickCount() < repeatStop)
+	do 
 	{
 		DSHOT_ERROR_CHECK(writePacket(packet, false));
 		vTaskDelay(1);
 	}
+	while (xTaskGetTickCount() < repeatStop);
 	return ESP_OK;
 }
