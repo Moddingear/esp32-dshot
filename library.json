@@ -1,0 +1,21 @@
+{
+	"name": "ESP32 ESC",
+	"version": "1.0.0",
+	"description": "A library to control ESC using DShot on the ESP32 using the RMT peripheral",
+	"keywords": "esp32, rmt, esc, dshot, bldc",
+	"repository":
+	{
+	  "type": "git",
+	  "url": "https://github.com/Moddingear/esp32-esc.git"
+	},
+	"authors":
+	[
+	  {
+		"name": "Gabriel Zerbib",
+		"email": "moddingear@gmail.com"
+	  }
+	],
+	"license": "MIT",
+	"frameworks": "arduino, espidf",
+	"platforms": "espressif32"
+  }
